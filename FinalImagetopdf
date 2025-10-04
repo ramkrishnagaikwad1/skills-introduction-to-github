@@ -1,0 +1,88 @@
+import net.sf.jasperreports.engine.JasperPrint;
+import net.sf.jasperreports.engine.JasperPrintManager;
+import org.apache.pdfbox.pdmodel.*;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.graphics.image.JPEGFactory;
+
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+
+public class JasperPrintToSafePDF {
+
+    private static final int MAX_PX = 8000;         // max allowed dimension (width/height)
+    private static final float MIN_DPI = 30f;       // don’t go below this
+    private static final float JPEG_QUALITY = 0.6f; // compression level (0.5–0.8 recommended)
+
+    public static byte[] exportToSafePdf(JasperPrint jasperPrint) throws Exception {
+        if (jasperPrint == null)
+            throw new IllegalArgumentException("jasperPrint is null");
+
+        try (PDDocument pdf = new PDDocument();
+             ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+
+            int pageCount = jasperPrint.getPages().size();
+
+            for (int i = 0; i < pageCount; i++) {
+
+                // Get Jasper page dimensions in points (1 pt = 1/72 inch)
+                double pageWidthPt = jasperPrint.getPageWidth();   // e.g. ~595 for A4
+                double pageHeightPt = jasperPrint.getPageHeight(); // e.g. ~842 for A4
+
+                // Compute the max DPI that keeps both dimensions under MAX_PX
+                double dpiByWidth  = (MAX_PX * 72.0) / pageWidthPt;
+                double dpiByHeight = (MAX_PX * 72.0) / pageHeightPt;
+
+                float safeDpi = (float) Math.min(dpiByWidth, dpiByHeight);
+                if (safeDpi > 150f) safeDpi = 150f; // prevent very high DPI
+                if (safeDpi < MIN_DPI) safeDpi = MIN_DPI;
+
+                // 🔹 Render page at calculated safe DPI
+                BufferedImage image = JasperPrintManager.printPageToImage(jasperPrint, i, safeDpi);
+
+                // Just to be extra-safe (some Jasper layouts still exceed bounds)
+                if (image.getWidth() > MAX_PX || image.getHeight() > MAX_PX) {
+                    image = resize(image, MAX_PX, MAX_PX);
+                }
+
+                // Compute physical PDF page size from image pixels and DPI
+                float widthPt  = (float) ((image.getWidth()  * 72.0) / safeDpi);
+                float heightPt = (float) ((image.getHeight() * 72.0) / safeDpi);
+
+                PDPage page = new PDPage(new PDRectangle(widthPt, heightPt));
+                pdf.addPage(page);
+
+                // Add image to PDF
+                var pdImage = JPEGFactory.createFromImage(pdf, image, JPEG_QUALITY);
+                try (PDPageContentStream cs = new PDPageContentStream(pdf, page)) {
+                    cs.drawImage(pdImage, 0, 0, widthPt, heightPt);
+                }
+
+                image.flush(); // free memory
+            }
+
+            pdf.save(baos);
+            return baos.toByteArray();
+        }
+    }
+
+    // Utility to resize an image to fit within max dimensions
+    private static BufferedImage resize(BufferedImage src, int maxW, int maxH) {
+        int w = src.getWidth();
+        int h = src.getHeight();
+        if (w <= maxW && h <= maxH) return src;
+
+        double scale = Math.min((double) maxW / w, (double) maxH / h);
+        int newW = Math.max(1, (int) (w * scale));
+        int newH = Math.max(1, (int) (h * scale));
+
+        BufferedImage resized = new BufferedImage(newW, newH, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = resized.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        g.setBackground(Color.WHITE);
+        g.clearRect(0, 0, newW, newH);
+        g.drawImage(src, 0, 0, newW, newH, null);
+        g.dispose();
+        return resized;
+    }
+}
