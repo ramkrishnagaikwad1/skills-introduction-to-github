@@ -1,0 +1,98 @@
+import net.sf.jasperreports.engine.JasperPrint;
+import net.sf.jasperreports.engine.JasperPrintManager;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.graphics.image.JPEGFactory;
+
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+
+public class JasperPrintToPDFCompact {
+
+    // MAX allowed dimensions for any page (in pixels)
+    private static final int MAX_WIDTH = 2000;
+    private static final int MAX_HEIGHT = 3000;
+    private static final float JPEG_QUALITY = 0.6f;  // Compression quality
+
+    public static byte[] convert(JasperPrint jasperPrint) throws Exception {
+        if (jasperPrint == null) {
+            throw new IllegalArgumentException("jasperPrint cannot be null");
+        }
+
+        try (PDDocument document = new PDDocument();
+             ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+
+            int pageCount = jasperPrint.getPages().size();
+
+            for (int pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+
+                // ✅ Start with a safe DPI
+                float renderDpi = 100f;
+                BufferedImage pageImage = null;
+
+                // ✅ Try to render safely (reduce DPI until it's valid)
+                for (int attempt = 0; attempt < 5; attempt++) {
+                    try {
+                        pageImage = JasperPrintManager.printPageToImage(jasperPrint, pageIndex, renderDpi);
+                        if (pageImage.getWidth() > MAX_WIDTH || pageImage.getHeight() > MAX_HEIGHT) {
+                            pageImage = resize(pageImage, MAX_WIDTH, MAX_HEIGHT);
+                        }
+                        break; // success
+                    } catch (IllegalArgumentException | NegativeArraySizeException e) {
+                        renderDpi /= 2; // lower DPI and try again
+                        if (renderDpi < 25f) renderDpi = 25f;
+                    }
+                }
+
+                if (pageImage == null) {
+                    throw new RuntimeException("Failed to render Jasper page " + pageIndex);
+                }
+
+                // ✅ Convert pixels → PDF points
+                float widthPt = (float) ((pageImage.getWidth() * 72.0) / 96.0);   // assume 96 DPI screen
+                float heightPt = (float) ((pageImage.getHeight() * 72.0) / 96.0);
+
+                PDPage page = new PDPage(new PDRectangle(widthPt, heightPt));
+                document.addPage(page);
+
+                var pdImage = JPEGFactory.createFromImage(document, pageImage, JPEG_QUALITY);
+
+                try (PDPageContentStream cs = new PDPageContentStream(document, page)) {
+                    cs.drawImage(pdImage, 0, 0, widthPt, heightPt);
+                }
+
+                pageImage.flush();
+            }
+
+            document.save(baos);
+            return baos.toByteArray();
+        }
+    }
+
+    private static BufferedImage resize(BufferedImage src, int maxW, int maxH) {
+        int w = src.getWidth();
+        int h = src.getHeight();
+
+        if (w <= 0 || h <= 0) {
+            w = 1;
+            h = 1;
+        }
+
+        double scale = Math.min((double) maxW / w, (double) maxH / h);
+        int newW = Math.max(1, (int) (w * scale));
+        int newH = Math.max(1, (int) (h * scale));
+
+        BufferedImage resized = new BufferedImage(newW, newH, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = resized.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        g.setBackground(Color.WHITE);
+        g.clearRect(0, 0, newW, newH);
+        g.drawImage(src, 0, 0, newW, newH, null);
+        g.dispose();
+
+        return resized;
+    }
+}
