@@ -1,0 +1,78 @@
+import net.sf.jasperreports.engine.JasperPrint;
+import net.sf.jasperreports.engine.JasperPrintManager;
+
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+
+import org.apache.pdfbox.pdmodel.*;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.graphics.image.JPEGFactory;
+
+public class JasperToLightPdf {
+
+    /**
+     * Convert JasperPrint to PDF bytes using low-DPI JPEG pages.
+     * Produces a much smaller byte array than high-res PNG rendering.
+     */
+    public static byte[] jasperPrintToCompressedPdf(JasperPrint jasperPrint) throws Exception {
+        if (jasperPrint == null)
+            throw new IllegalArgumentException("jasperPrint must not be null");
+
+        // Adjust DPI to control size vs clarity
+        final float dpi = 100f;      // try 72 – 150; lower → smaller
+        final float jpegQuality = 0.6f;  // 0.5 – 0.8 recommended
+
+        try (PDDocument doc = new PDDocument();
+             ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+
+            int pageCount = jasperPrint.getPages().size();
+
+            for (int i = 0; i < pageCount; i++) {
+                // Render each page at reduced DPI
+                BufferedImage pageImage = JasperPrintManager.printPageToImage(jasperPrint, i, dpi);
+
+                // Optional: scale down slightly again to shrink file
+                pageImage = scaleImage(pageImage, 0.9);
+
+                // Create PDF page same size as image (in points)
+                float widthPt  = (pageImage.getWidth()  / dpi) * 72f;
+                float heightPt = (pageImage.getHeight() / dpi) * 72f;
+                PDPage page = new PDPage(new PDRectangle(widthPt, heightPt));
+                doc.addPage(page);
+
+                // Add compressed JPEG to page
+                PDImageXObject pdImage = JPEGFactory.createFromImage(doc, pageImage, jpegQuality);
+                try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                    cs.drawImage(pdImage, 0, 0, widthPt, heightPt);
+                }
+
+                // Hint: release BufferedImage memory
+                pageImage.flush();
+            }
+
+            doc.save(baos);
+            return baos.toByteArray();
+        }
+    }
+
+    /** Optional scaling for additional compression */
+    private static BufferedImage scaleImage(BufferedImage src, double factor) {
+        int w = (int) (src.getWidth() * factor);
+        int h = (int) (src.getHeight() * factor);
+        BufferedImage scaled = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = scaled.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        g.drawImage(src, 0, 0, w, h, null);
+        g.dispose();
+        return scaled;
+    }
+
+    // Quick test harness
+    public static void main(String[] args) throws Exception {
+        // JasperPrint jasperPrint = ...; // your filled report
+        // byte[] pdfBytes = jasperPrintToCompressedPdf(jasperPrint);
+        // System.out.println("PDF size = " + pdfBytes.length + " bytes");
+    }
+}
