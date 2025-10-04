@@ -1,0 +1,75 @@
+import net.sf.jasperreports.engine.JasperPrint;
+import net.sf.jasperreports.engine.JasperPrintManager;
+import org.apache.pdfbox.pdmodel.*;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.graphics.image.JPEGFactory;
+
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+
+public class JasperToSafePdf {
+
+    public static byte[] jasperPrintToSafePdf(JasperPrint jasperPrint) throws Exception {
+        if (jasperPrint == null)
+            throw new IllegalArgumentException("jasperPrint must not be null");
+
+        float baseDpi = 100f; // start here
+        float jpegQuality = 0.6f;
+
+        try (PDDocument doc = new PDDocument();
+             ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+
+            int pages = jasperPrint.getPages().size();
+            for (int i = 0; i < pages; i++) {
+
+                float dpi = baseDpi;
+
+                // Retry loop for huge pages (auto-lower DPI)
+                BufferedImage pageImage = null;
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    pageImage = JasperPrintManager.printPageToImage(jasperPrint, i, dpi);
+                    if (pageImage.getWidth() < 10000 && pageImage.getHeight() < 10000)
+                        break;
+                    dpi = dpi * 0.7f; // reduce DPI further
+                }
+
+                // Final safety cap
+                pageImage = capMaxDimension(pageImage, 10000, 10000);
+
+                float widthPt  = (pageImage.getWidth()  / dpi) * 72f;
+                float heightPt = (pageImage.getHeight() / dpi) * 72f;
+                PDPage page = new PDPage(new PDRectangle(widthPt, heightPt));
+                doc.addPage(page);
+
+                PDImageXObject pdImage = JPEGFactory.createFromImage(doc, pageImage, jpegQuality);
+                try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                    cs.drawImage(pdImage, 0, 0, widthPt, heightPt);
+                }
+
+                pageImage.flush();
+            }
+
+            doc.save(baos);
+            return baos.toByteArray();
+        }
+    }
+
+    /** Rescales the image if it exceeds the max dimensions. */
+    private static BufferedImage capMaxDimension(BufferedImage src, int maxW, int maxH) {
+        int w = src.getWidth();
+        int h = src.getHeight();
+        if (w <= maxW && h <= maxH) return src;
+
+        double scale = Math.min((double) maxW / w, (double) maxH / h);
+        int newW = (int) (w * scale);
+        int newH = (int) (h * scale);
+
+        BufferedImage resized = new BufferedImage(newW, newH, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = resized.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        g.drawImage(src, 0, 0, newW, newH, null);
+        g.dispose();
+        return resized;
+    }
+}
