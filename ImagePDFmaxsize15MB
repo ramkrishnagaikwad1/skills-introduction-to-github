@@ -1,0 +1,158 @@
+package com.example.jasperpdf;
+
+import net.sf.jasperreports.engine.JasperPrint;
+import net.sf.jasperreports.engine.JasperPrintManager;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.graphics.image.JPEGFactory;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
+
+import javax.imageio.IIOImage;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
+import javax.imageio.stream.MemoryCacheImageOutputStream;
+import java.awt.image.BufferedImage;
+import java.io.*;
+import java.util.Iterator;
+import java.util.Locale;
+
+public class JasperPrintToPdfConverter {
+
+    /**
+     * Convert JasperPrint to PDF bytes trying to keep size <= maxBytes.
+     *
+     * @param jasperPrint the jasper print object
+     * @param initialScale starting scale for image render (e.g. 2.0f for higher quality)
+     * @param initialQuality jpeg quality [0f..1f]
+     * @param maxBytes max allowed size (bytes), converter will try to reduce quality/scale to fit
+     * @return byte[] PDF in memory
+     * @throws Exception on error
+     */
+    public static byte[] toPdfBytesWithSizeLimit(
+            JasperPrint jasperPrint,
+            float initialScale,
+            float initialQuality,
+            long maxBytes
+    ) throws Exception {
+
+        // safe bounds
+        final float MIN_QUALITY = 0.30f;
+        final float MIN_SCALE = 0.6f;
+
+        float scale = Math.max(0.1f, initialScale);
+        float quality = Math.max(0.01f, Math.min(1.0f, initialQuality));
+
+        // We'll attempt a few tries, each time reducing quality then scale when necessary
+        for (int attempt = 0; attempt < 8; attempt++) {
+            byte[] pdf = renderPdf(jasperPrint, scale, quality);
+            if (pdf.length <= maxBytes) {
+                return pdf;
+            }
+
+            // if too big, reduce quality first
+            if (quality > MIN_QUALITY + 0.01f) {
+                quality = Math.max(MIN_QUALITY, quality - 0.15f);
+            } else if (scale > MIN_SCALE + 0.05f) {
+                // reduce scale if quality already low
+                scale = Math.max(MIN_SCALE, scale - 0.25f);
+            } else {
+                // degrade both slightly if still too big
+                quality = Math.max(0.20f, quality - 0.05f);
+                scale = Math.max(0.5f, scale - 0.10f);
+            }
+        }
+
+        // last attempt: force lower values
+        return renderPdf(jasperPrint, Math.max(0.4f, scale), Math.max(0.20f, quality));
+    }
+
+    /**
+     * Renders JasperPrint to PDF bytes (single attempt with given scale & jpegQuality).
+     */
+    private static byte[] renderPdf(JasperPrint jasperPrint, float scale, float jpegQuality) throws Exception {
+        int pages = jasperPrint.getPages().size();
+        if (pages == 0) {
+            // create an empty PDF
+            try (PDDocument doc = new PDDocument();
+                 ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                doc.save(baos);
+                return baos.toByteArray();
+            }
+        }
+
+        try (PDDocument pdfDoc = new PDDocument();
+             ByteArrayOutputStream finalOut = new ByteArrayOutputStream()) {
+
+            // Render each Jasper page to image and add to PDF
+            for (int i = 0; i < pages; i++) {
+                // Render image from Jasper (scale controls resolution)
+                BufferedImage img = JasperPrintManager.printPageToImage(jasperPrint, i, scale);
+
+                // Ensure RGB (no alpha) for JPEG
+                BufferedImage rgb = new BufferedImage(img.getWidth(), img.getHeight(), BufferedImage.TYPE_INT_RGB);
+                rgb.createGraphics().drawImage(img, 0, 0, null);
+
+                // Use PDFBox JPEGFactory to create PDImageXObject with given quality.
+                // But PDFBox JPEGFactory doesn't accept quality in older versions; fallback to manual encoding.
+                PDImageXObject pdImage = createJpegPdImage(pdfDoc, rgb, jpegQuality);
+
+                // Create page sized to image (units are PDF user units/points).
+                // To preserve visual size, we set page rectangle to image pixel dimensions.
+                // This works well for visual fidelity; if you prefer A4 scaling, adjust this part.
+                PDRectangle rect = new PDRectangle(pdImage.getWidth(), pdImage.getHeight());
+                PDPage page = new PDPage(rect);
+                pdfDoc.addPage(page);
+
+                try (PDPageContentStream content = new PDPageContentStream(pdfDoc, page)) {
+                    // Draw image to fill the page
+                    content.drawImage(pdImage, 0, 0, pdImage.getWidth(), pdImage.getHeight());
+                }
+            }
+
+            pdfDoc.save(finalOut);
+            return finalOut.toByteArray();
+        }
+    }
+
+    /**
+     * Create a PDImageXObject encoded as JPEG with controllable quality using ImageIO,
+     * then use PDImageXObject.createFromByteArray to add to the document.
+     */
+    private static PDImageXObject createJpegPdImage(PDDocument doc, BufferedImage image, float quality) throws IOException {
+        // Clamp quality
+        quality = Math.max(0.01f, Math.min(1.0f, quality));
+
+        // Prepare JPEG bytes in memory using ImageIO writers and compression parameters
+        ByteArrayOutputStream imgBaos = new ByteArrayOutputStream(32_000);
+        try (MemoryCacheImageOutputStream mcios = new MemoryCacheImageOutputStream(imgBaos)) {
+            Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpeg");
+            if (!writers.hasNext()) {
+                // fallback: use PDFBox's JPEGFactory without explicit quality control
+                return JPEGFactory.createFromImage(doc, image);
+            }
+            ImageWriter writer = writers.next();
+            writer.setOutput(mcios);
+
+            ImageWriteParam param = writer.getDefaultWriteParam();
+            if (param.canWriteCompressed()) {
+                param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+                // quality in [0,1]
+                param.setCompressionQuality(quality);
+            }
+            writer.write(null, new IIOImage(image, null, null), param);
+            writer.dispose();
+        }
+
+        byte[] jpgBytes = imgBaos.toByteArray();
+        return PDImageXObject.createFromByteArray(doc, jpgBytes, "jasper-page");
+    }
+
+    // Example usage helper: get Base64 string
+    public static String toPdfBase64WithLimit(JasperPrint jasperPrint, float initialScale, float initialQuality, long maxBytes) throws Exception {
+        byte[] pdf = toPdfBytesWithSizeLimit(jasperPrint, initialScale, initialQuality, maxBytes);
+        return java.util.Base64.getEncoder().encodeToString(pdf);
+    }
+}
