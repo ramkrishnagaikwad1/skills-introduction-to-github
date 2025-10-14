@@ -1,0 +1,283 @@
+package com.example.jasper56; // adjust as needed
+
+import net.sf.jasperreports.engine.*;
+import net.sf.jasperreports.engine.export.JRGraphics2DExporter;
+import net.sf.jasperreports.engine.export.JRPdfExporter;
+import net.sf.jasperreports.engine.export.JRGraphics2DExporterParameter;
+import net.sf.jasperreports.engine.export.JRPdfExporterParameter;
+import net.sf.jasperreports.engine.JRExporterParameter;
+
+import org.apache.pdfbox.io.MemoryUsageSetting;
+import org.apache.pdfbox.multipdf.PDFMergerUtility;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
+
+import javax.imageio.IIOImage;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
+import javax.imageio.stream.MemoryCacheImageOutputStream;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.List;
+import java.util.concurrent.*;
+
+/**
+ * Final single-file solution (JasperReports 5.6 compatible).
+ *
+ * - Use Jasper56Compat to isolate deprecated setParameter() calls.
+ * - Export English pages as vector PDF, render other pages to images -> JPEG -> PDF.
+ * - Merge PDFs, enforce timeout and size limit.
+ */
+public class Jasper56FinalSolution {
+
+    // TUNABLE PARAMETERS
+    private static final int INITIAL_DPI = 300;             // starting DPI for rendering images
+    private static final int MIN_DPI = 90;                  // minimum DPI to try
+    private static final long MAX_BYTES = 5L * 1024L * 1024L; // 5 MB
+    private static final int TIMEOUT_SECONDS = 5;           // overall wall-clock timeout
+    private static final float[] QUALITY_STEPS = new float[]{0.9f, 0.8f, 0.6f, 0.45f, 0.3f};
+
+    /**
+     * Main API:
+     * - englishStartIndex..englishEndIndex (inclusive, 0-based) are exported as vector PDF.
+     * - remaining pages are rendered to images and added as image-PDF.
+     * - merged PDF is returned as byte[].
+     */
+    public static byte[] exportSplitMerge(final JasperPrint jasperPrint,
+                                         final int englishStartIndex,
+                                         final int englishEndIndex) throws Exception {
+
+        Callable<byte[]> task = () -> {
+            int totalPages = jasperPrint.getPages().size();
+            if (englishStartIndex < 0 || englishEndIndex < englishStartIndex || englishEndIndex >= totalPages) {
+                throw new IllegalArgumentException("Invalid englishStartIndex/englishEndIndex");
+            }
+
+            // 1) Copy english pages into a new JasperPrint
+            JasperPrint englishPrint = copyPages(jasperPrint, englishStartIndex, englishEndIndex);
+
+            // 2) Export english vector PDF bytes
+            byte[] englishPdf = Jasper56Compat.exportPdfToBytes(englishPrint);
+
+            // 3) Collect hindi page indexes (outside english range)
+            List<Integer> hindiPages = new ArrayList<>();
+            for (int i = 0; i < totalPages; i++) {
+                if (i < englishStartIndex || i > englishEndIndex) hindiPages.add(i);
+            }
+
+            // 4) Build hindi PDF (images -> PDF) trying to meet MAX_BYTES
+            byte[] hindiPdf;
+            if (hindiPages.isEmpty()) {
+                hindiPdf = createEmptyPdf();
+            } else {
+                hindiPdf = buildPdfFromRenderedPagesWithTarget(jasperPrint, hindiPages, INITIAL_DPI, MAX_BYTES);
+            }
+
+            // 5) Merge english + hindi PDFs
+            byte[] merged = mergePdfBytes(Arrays.asList(englishPdf, hindiPdf));
+
+            // Final size check
+            if (merged.length > MAX_BYTES) {
+                throw new IOException("Merged PDF exceeds allowed maximum (" + merged.length + " bytes)");
+            }
+            return merged;
+        };
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<byte[]> future = executor.submit(task);
+        try {
+            return future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException te) {
+            future.cancel(true);
+            throw new TimeoutException("Operation timed out after " + TIMEOUT_SECONDS + " seconds");
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    // ----------------- Helper methods -----------------
+
+    private static JasperPrint copyPages(JasperPrint src, int startInclusive, int endInclusive) {
+        JasperPrint dest = new JasperPrint();
+        dest.setName(src.getName());
+        dest.setPageWidth(src.getPageWidth());
+        dest.setPageHeight(src.getPageHeight());
+        dest.setOrientation(src.getOrientationValue());
+        if (src.getPropertiesMap() != null) dest.setPropertyMap(new HashMap<>(src.getPropertiesMap()));
+
+        @SuppressWarnings("unchecked")
+        List<JRPrintPage> pages = src.getPages();
+        @SuppressWarnings("unchecked")
+        List<JRPrintPage> destPages = dest.getPages();
+        for (int i = startInclusive; i <= endInclusive; i++) {
+            destPages.add(pages.get(i));
+        }
+        return dest;
+    }
+
+    private static byte[] createEmptyPdf() throws IOException {
+        try (PDDocument doc = new PDDocument(); ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+            doc.save(baos);
+            return baos.toByteArray();
+        }
+    }
+
+    private static byte[] mergePdfBytes(List<byte[]> pdfs) throws IOException {
+        PDFMergerUtility merger = new PDFMergerUtility();
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (byte[] p : pdfs) merger.addSource(new ByteArrayInputStream(p));
+        merger.setDestinationStream(out);
+        merger.mergeDocuments(MemoryUsageSetting.setupMainMemoryOnly());
+        return out.toByteArray();
+    }
+
+    private static byte[] buildPdfFromRenderedPagesWithTarget(JasperPrint source,
+                                                              List<Integer> pageIndexes,
+                                                              int initialDpi,
+                                                              long maxBytes) throws Exception {
+        int dpi = initialDpi;
+
+        while (dpi >= MIN_DPI) {
+            List<BufferedImage> images = new ArrayList<>(pageIndexes.size());
+            for (int idx : pageIndexes) {
+                BufferedImage img = Jasper56Compat.renderPageToImage(source, idx, dpi);
+                images.add(img);
+            }
+
+            for (float q : QUALITY_STEPS) {
+                byte[] pdf = createPdfFromImages(images, dpi, q);
+                if (pdf.length <= maxBytes) return pdf;
+            }
+            dpi -= 60; // reduce DPI and retry
+        }
+
+        // Final attempt at low DPI + lowest quality
+        List<BufferedImage> images = new ArrayList<>();
+        for (int idx : pageIndexes) images.add(Jasper56Compat.renderPageToImage(source, idx, Math.max(MIN_DPI, 72)));
+        byte[] finalPdf = createPdfFromImages(images, Math.max(MIN_DPI, 72), QUALITY_STEPS[QUALITY_STEPS.length - 1]);
+        if (finalPdf.length > maxBytes) {
+            throw new IOException("Unable to reach target size " + maxBytes + ". Final: " + finalPdf.length);
+        }
+        return finalPdf;
+    }
+
+    private static byte[] createPdfFromImages(List<BufferedImage> images, int dpi, float quality) throws IOException {
+        try (PDDocument doc = new PDDocument(); ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+            for (BufferedImage bi : images) {
+                float widthPts = bi.getWidth() * 72f / dpi;
+                float heightPts = bi.getHeight() * 72f / dpi;
+                PDPage page = new PDPage(new PDRectangle(widthPts, heightPts));
+                doc.addPage(page);
+
+                byte[] jpg = bufferedImageToJpegBytes(bi, quality);
+                PDImageXObject pdImg = PDImageXObject.createFromByteArray(doc, jpg, "img");
+                try (org.apache.pdfbox.pdmodel.PDPageContentStream cs =
+                             new org.apache.pdfbox.pdmodel.PDPageContentStream(doc, page)) {
+                    cs.drawImage(pdImg, 0, 0, widthPts, heightPts);
+                }
+            }
+            doc.save(baos);
+            return baos.toByteArray();
+        }
+    }
+
+    private static byte[] bufferedImageToJpegBytes(BufferedImage image, float quality) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpeg");
+        if (!writers.hasNext()) {
+            // fallback if jpeg writer not found
+            ImageIO.write(image, "png", baos);
+            return baos.toByteArray();
+        }
+        ImageWriter writer = writers.next();
+        ImageWriteParam param = writer.getDefaultWriteParam();
+        if (param.canWriteCompressed()) {
+            param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+            param.setCompressionQuality(Math.max(0.01f, Math.min(1f, quality)));
+        }
+        try (MemoryCacheImageOutputStream mcios = new MemoryCacheImageOutputStream(baos)) {
+            writer.setOutput(mcios);
+            IIOImage iio = new IIOImage(image, null, null);
+            writer.write(null, iio, param);
+            mcios.flush();
+            writer.dispose();
+        }
+        return baos.toByteArray();
+    }
+
+    // ------------------ Demo main (illustrative) ------------------
+    // Replace loading/filling with your actual application logic.
+    public static void main(String[] args) throws Exception {
+        if (args.length < 3) {
+            System.out.println("Usage: java -jar app.jar <compiledReport.jasper> <englishStart> <englishEnd>");
+            return;
+        }
+        String jasperFile = args[0];
+        int englishStart = Integer.parseInt(args[1]);
+        int englishEnd = Integer.parseInt(args[2]);
+
+        // Load compiled .jasper and fill (use your real datasource & params)
+        JasperReport report = (JasperReport) JRLoader.loadObjectFromFile(jasperFile);
+        JasperPrint jasperPrint = JasperFillManager.fillReport(report, new HashMap<>(), new JREmptyDataSource());
+
+        byte[] out = exportSplitMerge(jasperPrint, englishStart, englishEnd);
+        Files.write(Paths.get("final_merged.pdf"), out);
+        System.out.println("Written final_merged.pdf (size=" + out.length + " bytes)");
+    }
+}
+
+/**
+ * Helper class isolating deprecated JasperReports 5.6 API calls.
+ * Keep all deprecated usage here and suppress warnings. This makes
+ * the rest of your code clean and future-upgrade-friendly.
+ */
+final class Jasper56Compat {
+
+    private Jasper56Compat() { }
+
+    @SuppressWarnings("deprecation")
+    public static byte[] exportPdfToBytes(JasperPrint jp) throws JRException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        JRPdfExporter exporter = new JRPdfExporter();
+        exporter.setParameter(JRExporterParameter.JASPER_PRINT, jp);
+        exporter.setParameter(JRExporterParameter.OUTPUT_STREAM, baos);
+        exporter.setParameter(JRPdfExporterParameter.IS_COMPRESSED, Boolean.TRUE);
+        exporter.exportReport();
+        return baos.toByteArray();
+    }
+
+    @SuppressWarnings("deprecation")
+    public static BufferedImage renderPageToImage(JasperPrint jasperPrint, int pageIndex, int dpi) throws JRException {
+        int pageWidthPoints = jasperPrint.getPageWidth();
+        int pageHeightPoints = jasperPrint.getPageHeight();
+
+        int imgW = Math.max(1, Math.round(pageWidthPoints * dpi / 72f));
+        int imgH = Math.max(1, Math.round(pageHeightPoints * dpi / 72f));
+
+        BufferedImage image = new BufferedImage(imgW, imgH, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g2d = image.createGraphics();
+        try {
+            g2d.setPaint(Color.WHITE);
+            g2d.fillRect(0, 0, imgW, imgH);
+
+            double scale = dpi / 72d;
+            g2d.scale(scale, scale);
+
+            JRGraphics2DExporter exporter = new JRGraphics2DExporter();
+            exporter.setParameter(JRExporterParameter.JASPER_PRINT, jasperPrint);
+            exporter.setParameter(JRGraphics2DExporterParameter.GRAPHICS_2D, g2d);
+            exporter.setParameter(JRGraphics2DExporterParameter.PAGE_INDEX, pageIndex);
+            exporter.exportReport();
+        } finally {
+            g2d.dispose();
+        }
+        return image;
+    }
+}
