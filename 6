@@ -1,0 +1,105 @@
+import net.sf.jasperreports.engine.*;
+import net.sf.jasperreports.engine.JasperPrintManager;
+
+import com.itextpdf.text.*;
+import com.itextpdf.text.pdf.*;
+
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.*;
+import java.util.concurrent.*;
+
+public class JasperPdfUtilsOptimized {
+
+    private static final int MAX_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+    private static final int TIMEOUT_SECONDS = 10;
+
+    public static byte[] exportJasperPrintWithSplitOptimized(JasperPrint jasperPrint) throws Exception {
+
+        Callable<byte[]> task = () -> {
+            int totalPages = jasperPrint.getPages().size();
+            int mid = totalPages / 2;
+
+            // --------------------------
+            // 1. Export English pages normally
+            // --------------------------
+            JasperPrint englishPrint = new JasperPrint();
+            englishPrint.setName(jasperPrint.getName());
+            englishPrint.setPageWidth(jasperPrint.getPageWidth());
+            englishPrint.setPageHeight(jasperPrint.getPageHeight());
+            englishPrint.setOrientation(jasperPrint.getOrientationValue());
+
+            for (int i = 0; i < mid; i++) {
+                englishPrint.addPage(jasperPrint.getPages().get(i));
+            }
+
+            ByteArrayOutputStream englishBaos = new ByteArrayOutputStream();
+            JasperExportManager.exportReportToPdfStream(englishPrint, englishBaos);
+
+            // --------------------------
+            // 2. Export Hindi pages as images (compressed)
+            // --------------------------
+            ByteArrayOutputStream hindiBaos = new ByteArrayOutputStream();
+            Document document = new Document();
+            PdfWriter writer = PdfWriter.getInstance(document, hindiBaos);
+            document.open();
+
+            for (int i = mid; i < totalPages; i++) {
+                // Render page to image
+                BufferedImage pageImage = JasperPrintManager.printPageToImage(jasperPrint, i, 1.5f); // moderate zoom for quality
+
+                // Compress image to reduce PDF size
+                ByteArrayOutputStream imgBaos = new ByteArrayOutputStream();
+                ImageIO.write(pageImage, "jpg", imgBaos); // JPG compression
+                com.itextpdf.text.Image img = com.itextpdf.text.Image.getInstance(imgBaos.toByteArray());
+
+                document.setPageSize(new Rectangle(img.getWidth(), img.getHeight()));
+                document.newPage();
+                document.add(img);
+            }
+            document.close();
+
+            // --------------------------
+            // 3. Merge English and Hindi PDFs
+            // --------------------------
+            ByteArrayOutputStream finalBaos = new ByteArrayOutputStream();
+            PdfReader englishReader = new PdfReader(englishBaos.toByteArray());
+            PdfReader hindiReader = new PdfReader(hindiBaos.toByteArray());
+            Document finalDocument = new Document();
+            PdfCopy copy = new PdfCopy(finalDocument, finalBaos);
+            finalDocument.open();
+
+            for (int i = 1; i <= englishReader.getNumberOfPages(); i++) {
+                copy.addPage(copy.getImportedPage(englishReader, i));
+            }
+            for (int i = 1; i <= hindiReader.getNumberOfPages(); i++) {
+                copy.addPage(copy.getImportedPage(hindiReader, i));
+            }
+
+            finalDocument.close();
+            englishReader.close();
+            hindiReader.close();
+
+            byte[] result = finalBaos.toByteArray();
+            if (result.length > MAX_SIZE_BYTES) {
+                throw new Exception("PDF exceeds maximum allowed size of 10 MB");
+            }
+
+            return result;
+        };
+
+        // --------------------------
+        // 4. Execute with timeout
+        // --------------------------
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<byte[]> future = executor.submit(task);
+        try {
+            return future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw new Exception("PDF generation timed out after " + TIMEOUT_SECONDS + " seconds");
+        } finally {
+            executor.shutdown();
+        }
+    }
+}
