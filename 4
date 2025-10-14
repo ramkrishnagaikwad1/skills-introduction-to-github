@@ -1,0 +1,125 @@
+import net.sf.jasperreports.engine.*;
+import net.sf.jasperreports.engine.export.*;
+import net.sf.jasperreports.engine.export.JRGraphics2DExporterParameter;
+import com.lowagie.text.*;
+import com.lowagie.text.pdf.*;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.io.*;
+import java.util.*;
+import javax.imageio.ImageIO;
+
+public class Jasper56FinalExporter {
+
+    @SuppressWarnings("deprecation")
+    public static byte[] exportJasperToHybridPDF(JasperPrint jasperPrint) throws Exception {
+        if (jasperPrint == null) {
+            throw new IllegalArgumentException("JasperPrint cannot be null");
+        }
+
+        int totalPages = jasperPrint.getPages().size();
+        int half = totalPages / 2;
+
+        // --- English section (first half) ---
+        ByteArrayOutputStream englishOut = new ByteArrayOutputStream();
+        JRPdfExporter pdfExporter = new JRPdfExporter();
+        pdfExporter.setParameter(JRExporterParameter.JASPER_PRINT, getSubPrint(jasperPrint, 0, half - 1));
+        pdfExporter.setParameter(JRExporterParameter.OUTPUT_STREAM, englishOut);
+        pdfExporter.exportReport();
+
+        // --- Hindi section (image-rendered) ---
+        ByteArrayOutputStream hindiOut = new ByteArrayOutputStream();
+        Document hindiDoc = new Document();
+        PdfWriter.getInstance(hindiDoc, hindiOut);
+        hindiDoc.open();
+
+        for (int i = half; i < totalPages; i++) {
+            BufferedImage image = renderPageAsImage(jasperPrint, i, 150);
+            if (image == null) continue;
+
+            ByteArrayOutputStream imgBytes = new ByteArrayOutputStream();
+            ImageIO.write(image, "png", imgBytes);
+
+            Image pdfImage = Image.getInstance(imgBytes.toByteArray());
+            pdfImage.scaleToFit(PageSize.A4.getWidth(), PageSize.A4.getHeight());
+            hindiDoc.setPageSize(new Rectangle(pdfImage.getScaledWidth(), pdfImage.getScaledHeight()));
+            hindiDoc.newPage();
+            hindiDoc.add(pdfImage);
+        }
+
+        hindiDoc.close();
+
+        // --- Merge both PDFs in memory ---
+        return mergePDFs(englishOut.toByteArray(), hindiOut.toByteArray());
+    }
+
+    @SuppressWarnings("deprecation")
+    private static BufferedImage renderPageAsImage(JasperPrint print, int pageIndex, int dpi) throws JRException {
+        int width = (int) (print.getPageWidth() * dpi / 72f);
+        int height = (int) (print.getPageHeight() * dpi / 72f);
+        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+
+        Graphics2D g = image.createGraphics();
+        g.setPaint(Color.WHITE);
+        g.fillRect(0, 0, width, height);
+        g.scale(dpi / 72f, dpi / 72f);
+
+        JRGraphics2DExporter exp = new JRGraphics2DExporter();
+        exp.setParameter(JRExporterParameter.JASPER_PRINT, print);
+        exp.setParameter(JRGraphics2DExporterParameter.GRAPHICS_2D, g);
+        exp.setParameter(JRGraphics2DExporterParameter.PAGE_INDEX, pageIndex);
+        exp.exportReport();
+
+        g.dispose();
+        return image;
+    }
+
+    @SuppressWarnings("deprecation")
+    private static JasperPrint getSubPrint(JasperPrint original, int startPage, int endPage) {
+        JasperPrint sub = new JasperPrint();
+        sub.setName(original.getName());
+        sub.setPageWidth(original.getPageWidth());
+        sub.setPageHeight(original.getPageHeight());
+        sub.setOrientation(original.getOrientation());
+        sub.setPropertiesMap(new HashMap<String, Object>());
+        sub.setDefaultStyleProvider(original.getDefaultStyleProvider());
+
+        List<JRPrintPage> pages = original.getPages().subList(startPage, endPage + 1);
+        sub.getPages().addAll(pages);
+        return sub;
+    }
+
+    private static byte[] mergePDFs(byte[] pdf1, byte[] pdf2) throws Exception {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        Document document = new Document();
+        PdfCopy copy = new PdfCopy(document, output);
+        document.open();
+
+        PdfReader reader1 = new PdfReader(pdf1);
+        PdfReader reader2 = new PdfReader(pdf2);
+
+        copy.addDocument(reader1);
+        copy.addDocument(reader2);
+
+        reader1.close();
+        reader2.close();
+        document.close();
+
+        return output.toByteArray();
+    }
+
+    // Example test
+    public static void main(String[] args) throws Exception {
+        // Suppose jasperPrint is already filled.
+        JasperPrint jasperPrint = getSampleJasperPrint(); // Replace with your real data
+        byte[] finalPdf = exportJasperToHybridPDF(jasperPrint);
+
+        System.out.println("Final PDF bytes: " + finalPdf.length);
+        System.out.println("✅ Successfully merged English (export) + Hindi (image) sections in memory.");
+    }
+
+    // Placeholder — you’ll replace with your real JasperPrint
+    private static JasperPrint getSampleJasperPrint() {
+        return new JasperPrint(); // Just placeholder for demo
+    }
+}
