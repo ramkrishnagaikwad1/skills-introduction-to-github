@@ -1,0 +1,227 @@
+import net.sf.jasperreports.engine.JasperPrint;
+import net.sf.jasperreports.engine.JasperPrintManager;
+
+import com.itextpdf.text.Document;
+import com.itextpdf.text.Rectangle;
+import com.itextpdf.text.pdf.PdfCopy;
+import com.itextpdf.text.pdf.PdfReader;
+import com.itextpdf.text.pdf.PdfWriter;
+import com.itextpdf.text.Image;
+
+import javax.imageio.IIOImage;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
+import javax.imageio.stream.MemoryCacheImageOutputStream;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.Iterator;
+import java.util.concurrent.*;
+
+public class JasperPdfUtilsWithAdaptiveFallback {
+
+    private static final int MAX_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+    private static final int TIMEOUT_SECONDS = 10;
+
+    /**
+     * Exports JasperPrint:
+     * - first half pages -> normal PDF export (English)
+     * - second half pages -> rendered as image pages (Hindi)
+     * Tries multiple (scale,quality) combos for Hindi until merged PDF <= 10MB.
+     *
+     * Returns merged PDF bytes or throws on timeout. If no combo is successful, throws with best result info.
+     */
+    public static byte[] exportWithAdaptiveFallback(final JasperPrint jasperPrint) throws Exception {
+        if (jasperPrint == null) throw new IllegalArgumentException("jasperPrint is null");
+
+        // Search order for scale and quality (you can reorder or add more pairs)
+        final float[] scales = new float[] {2.0f, 1.5f, 1.0f};
+        final float[] qualities = new float[] {1.0f, 0.9f, 0.8f, 0.7f};
+
+        Callable<byte[]> task = () -> {
+            int totalPages = jasperPrint.getPages().size();
+            int mid = totalPages / 2;
+
+            // 1) Prepare English PDF once
+            byte[] englishPdf = exportEnglishPart(jasperPrint, mid);
+
+            byte[] bestResult = null;
+            int bestSize = Integer.MAX_VALUE;
+            String bestParams = null;
+
+            // 2) Try combinations
+            for (float scale : scales) {
+                for (float quality : qualities) {
+                    // Generate Hindi PDF bytes for this combo
+                    byte[] hindiPdf;
+                    try {
+                        hindiPdf = generateHindiPdfBytes(jasperPrint, mid, totalPages, scale, quality);
+                    } catch (Throwable t) {
+                        // If image rendering fails for some reason, skip this combo
+                        continue;
+                    }
+
+                    // Merge english + hindi
+                    byte[] merged = mergePdfBytes(englishPdf, hindiPdf);
+
+                    if (merged == null) continue;
+
+                    int mergedSize = merged.length;
+                    // track best
+                    if (mergedSize < bestSize) {
+                        bestSize = mergedSize;
+                        bestResult = merged;
+                        bestParams = "scale=" + scale + ",quality=" + quality;
+                    }
+
+                    // success condition
+                    if (mergedSize <= MAX_SIZE_BYTES) {
+                        // success - return merged bytes
+                        return merged;
+                    }
+
+                    // else continue trying
+                }
+            }
+
+            // none succeeded within size limit -> throw with best info
+            if (bestResult != null) {
+                throw new Exception("Unable to produce PDF <= " + MAX_SIZE_BYTES +
+                        " bytes. Best attempt size=" + bestSize + " bytes with params: " + bestParams);
+            } else {
+                throw new Exception("Unable to generate Hindi pages PDF (no successful attempts).");
+            }
+        };
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<byte[]> future = executor.submit(task);
+        try {
+            return future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException te) {
+            future.cancel(true);
+            throw new Exception("PDF generation timed out after " + TIMEOUT_SECONDS + " seconds", te);
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    // Export the English half via JasperExportManager (normal PDF)
+    private static byte[] exportEnglishPart(JasperPrint jasperPrint, int mid) throws JRException, IOException {
+        JasperPrint englishPrint = new JasperPrint();
+        englishPrint.setName(jasperPrint.getName());
+        englishPrint.setPageWidth(jasperPrint.getPageWidth());
+        englishPrint.setPageHeight(jasperPrint.getPageHeight());
+        englishPrint.setOrientation(jasperPrint.getOrientationValue());
+
+        for (int p = 0; p < mid; p++) {
+            englishPrint.addPage(jasperPrint.getPages().get(p));
+        }
+
+        ByteArrayOutputStream englishBaos = new ByteArrayOutputStream();
+        net.sf.jasperreports.engine.JasperExportManager.exportReportToPdfStream(englishPrint, englishBaos);
+        return englishBaos.toByteArray();
+    }
+
+    // Generate Hindi PDF bytes by rendering pages to JPEG at given scale & quality
+    private static byte[] generateHindiPdfBytes(JasperPrint jasperPrint, int startPage, int totalPages,
+                                                float renderScale, float jpegQuality) throws Exception {
+
+        ByteArrayOutputStream hindiBaos = new ByteArrayOutputStream();
+        Document hindiDoc = new Document();
+        PdfWriter hindiWriter = PdfWriter.getInstance(hindiDoc, hindiBaos);
+        hindiDoc.open();
+
+        // Use page w/h from jasperPrint (assumes consistent size); if variable, derive per page
+        float pageW = jasperPrint.getPageWidth();
+        float pageH = jasperPrint.getPageHeight();
+
+        for (int p = startPage; p < totalPages; p++) {
+            // Render at requested scale
+            BufferedImage pageImage = JasperPrintManager.printPageToImage(jasperPrint, p, renderScale);
+
+            // Convert to JPEG bytes with requested quality
+            byte[] jpegBytes = bufferedImageToJpegBytes(pageImage, jpegQuality);
+
+            Image img = Image.getInstance(jpegBytes);
+
+            // Ensure PDF page uses same user units as Jasper page
+            hindiDoc.setPageSize(new Rectangle(pageW, pageH));
+            hindiDoc.newPage();
+
+            // Make image fill the page exactly: use scaleAbsolute to match page size
+            img.scaleAbsolute(pageW, pageH);
+            img.setAbsolutePosition(0f, 0f);
+
+            hindiDoc.add(img);
+        }
+
+        hindiDoc.close();
+        hindiWriter.close();
+
+        return hindiBaos.toByteArray();
+    }
+
+    // Merge two PDFs (english first, then hindi)
+    private static byte[] mergePdfBytes(byte[] pdf1, byte[] pdf2) throws Exception {
+        if (pdf1 == null || pdf2 == null) return null;
+
+        ByteArrayOutputStream finalBaos = new ByteArrayOutputStream();
+        PdfReader reader1 = new PdfReader(pdf1);
+        PdfReader reader2 = new PdfReader(pdf2);
+
+        Document finalDoc = new Document();
+        PdfCopy copy = new PdfCopy(finalDoc, finalBaos);
+        finalDoc.open();
+
+        for (int i = 1; i <= reader1.getNumberOfPages(); i++) {
+            copy.addPage(copy.getImportedPage(reader1, i));
+        }
+        for (int i = 1; i <= reader2.getNumberOfPages(); i++) {
+            copy.addPage(copy.getImportedPage(reader2, i));
+        }
+
+        finalDoc.close();
+        copy.close();
+        reader1.close();
+        reader2.close();
+
+        return finalBaos.toByteArray();
+    }
+
+    /**
+     * Convert BufferedImage to JPEG byte[] with given quality (0..1).
+     */
+    private static byte[] bufferedImageToJpegBytes(BufferedImage image, float quality) throws IOException {
+        if (image == null) throw new IllegalArgumentException("image is null");
+
+        Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpg");
+        if (!writers.hasNext()) throw new IllegalStateException("No JPEG writers available");
+        ImageWriter writer = writers.next();
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        MemoryCacheImageOutputStream ios = new MemoryCacheImageOutputStream(baos);
+        writer.setOutput(ios);
+
+        ImageWriteParam param = writer.getDefaultWriteParam();
+        if (param.canWriteCompressed()) {
+            param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+            param.setCompressionQuality(Math.max(0f, Math.min(1f, quality)));
+        }
+
+        // convert alpha if present
+        BufferedImage rgbImage;
+        if (image.getColorModel().hasAlpha()) {
+            rgbImage = new BufferedImage(image.getWidth(), image.getHeight(), BufferedImage.TYPE_INT_RGB);
+            rgbImage.getGraphics().drawImage(image, 0, 0, null);
+        } else {
+            rgbImage = image;
+        }
+
+        writer.write(null, new IIOImage(rgbImage, null, null), param);
+        ios.close();
+        writer.dispose();
+
+        return baos.toByteArray();
+    }
+}
