@@ -1,0 +1,13 @@
+Subject: Update on Hindi Report Development Status
+
+Dear [Manager’s Name],
+
+I would like to share an update regarding the Hindi report development.
+
+As part of the recent architecture changes, the font has been updated from Arial.ttf to arial-unicode-ms.ttf in the Home Loan module. Due to this change, all existing reports need to be tested again to ensure proper rendering.
+
+For the Hindi report generation process, we selected the JasperPrint-to-image conversion approach because Hindi joint words were not displaying correctly in the normal text-based PDF output. However, this approach has significantly increased both time and space complexity, as the report contains around 62 pages, and each image page is approximately 400 KB, resulting in a total size of nearly 24.8 MB.
+
+To optimize this, further R&D is required to identify a cleaner and more efficient solution that can reduce the processing time and file size. This is a technically challenging task, so it may take additional time to finalize a stable and optimized approach.
+
+Apologies for the inconvenience, but at this stage, I’m unable to provide an exact completion timeline. I’ll keep you updated as progress continues.
