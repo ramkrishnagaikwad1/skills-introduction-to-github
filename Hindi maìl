@@ -1,0 +1,6 @@
+As per your requirement for handling Hindi and English KFS reports via a flag mechanism, and considering the issues identified after production, I have proposed to manage this flag within the KFS Stored Procedure and map it directly to the report. This approach will ensure consistent and safe handling of both English and Hindi report generation.
+
+Requesting you to please confirm this approach.
+
+Upon confirmation, I request RLMSDBA to add the new parameter to the KFS Stored Procedure in the SIT1 environment.
+Alternatively, Yogesh, please assign an appropriate DBA resource to carry out this activity.
