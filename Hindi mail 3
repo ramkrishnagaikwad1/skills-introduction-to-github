@@ -1,0 +1,6 @@
+Thank you for sharing the payload format and the details.
+
+As per the database, I can see that only 6 report constants are present in the RPT_TYPE_MST table.
+Just to confirm — are these same 6 report types mapped to all 16 product variants?
+
+Please confirm so I can proceed correctly.
